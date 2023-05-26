@@ -1209,6 +1209,265 @@ JNI_METHOD(void, read)
     }
 
     callback->mReadClient = readClient;
+
+exit:
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(Controller, "JNI IM Read Error: %s", err.AsString());
+        if (err == CHIP_JNI_ERROR_EXCEPTION_THROWN)
+        {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        callback->OnError(err);
+        if (readClient != nullptr)
+        {
+            Platform::Delete(readClient);
+        }
+        if (callback != nullptr)
+        {
+            Platform::Delete(callback);
+        }
+    }
+}
+
+JNI_METHOD(void, write)
+(JNIEnv * env, jobject self, jlong handle, jlong callbackHandle, jlong devicePtr, jobject attributeList, jint timedRequestTimeoutMs,
+ jint imTimeoutMs)
+{
+    chip::DeviceLayer::StackLock lock;
+    CHIP_ERROR err = CHIP_NO_ERROR;
+    jint listSize  = 0;
+    auto callback  = reinterpret_cast<WriteAttributesCallback *>(callbackHandle);
+    app::WriteClient * writeClient;
+
+    ChipLogDetail(Controller, "IM write() called");
+
+    DeviceProxy * device = reinterpret_cast<DeviceProxy *>(devicePtr);
+    VerifyOrExit(device != nullptr, err = CHIP_ERROR_INCORRECT_STATE);
+    VerifyOrExit(device->GetSecureSession().HasValue(), err = CHIP_ERROR_MISSING_SECURE_SESSION);
+    VerifyOrExit(attributeList != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+    SuccessOrExit(err = JniReferences::GetInstance().GetListSize(attributeList, listSize));
+
+    writeClient = Platform::New<app::WriteClient>(device->GetExchangeManager(), callback->GetChunkedWriteCallback(),
+                                                  timedRequestTimeoutMs != 0 ? Optional<uint16_t>(timedRequestTimeoutMs)
+                                                                             : Optional<uint16_t>::Missing());
+
+    for (uint8_t i = 0; i < listSize; i++)
+    {
+        jobject attributeItem             = nullptr;
+        uint32_t endpointId               = 0;
+        uint32_t clusterId                = 0;
+        uint32_t attributeId              = 0;
+        jmethodID getEndpointIdMethod     = nullptr;
+        jmethodID getClusterIdMethod      = nullptr;
+        jmethodID getAttributeIdMethod    = nullptr;
+        jmethodID hasDataVersionMethod    = nullptr;
+        jmethodID getDataVersionMethod    = nullptr;
+        jmethodID getTlvByteArrayMethod   = nullptr;
+        jobject endpointIdObj             = nullptr;
+        jobject clusterIdObj              = nullptr;
+        jobject attributeIdObj            = nullptr;
+        jbyteArray tlvBytesObj            = nullptr;
+        bool hasDataVersion               = false;
+        Optional<DataVersion> dataVersion = Optional<DataVersion>();
+        ;
+        jbyte * tlvBytesObjBytes = nullptr;
+        jsize length             = 0;
+        TLV::TLVReader reader;
+
+        SuccessOrExit(err = JniReferences::GetInstance().GetListItem(attributeList, i, attributeItem));
+        SuccessOrExit(err = JniReferences::GetInstance().FindMethod(
+                          env, attributeItem, "getEndpointId", "()Lchip/devicecontroller/model/ChipPathId;", &getEndpointIdMethod));
+        SuccessOrExit(err = JniReferences::GetInstance().FindMethod(
+                          env, attributeItem, "getClusterId", "()Lchip/devicecontroller/model/ChipPathId;", &getClusterIdMethod));
+        SuccessOrExit(err = JniReferences::GetInstance().FindMethod(env, attributeItem, "getAttributeId",
+                                                                    "()Lchip/devicecontroller/model/ChipPathId;",
+                                                                    &getAttributeIdMethod));
+        SuccessOrExit(
+            err = JniReferences::GetInstance().FindMethod(env, attributeItem, "hasDataVersion", "()Z", &hasDataVersionMethod));
+        SuccessOrExit(
+            err = JniReferences::GetInstance().FindMethod(env, attributeItem, "getDataVersion", "()I", &getDataVersionMethod));
+        SuccessOrExit(
+            err = JniReferences::GetInstance().FindMethod(env, attributeItem, "getTlvByteArray", "()[B", &getTlvByteArrayMethod));
+
+        endpointIdObj = env->CallObjectMethod(attributeItem, getEndpointIdMethod);
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        VerifyOrExit(endpointIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+        clusterIdObj = env->CallObjectMethod(attributeItem, getClusterIdMethod);
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        VerifyOrExit(clusterIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+        attributeIdObj = env->CallObjectMethod(attributeItem, getAttributeIdMethod);
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        VerifyOrExit(attributeIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+        SuccessOrExit(err = GetChipPathIdValue(endpointIdObj, kInvalidEndpointId, endpointId));
+        SuccessOrExit(err = GetChipPathIdValue(clusterIdObj, kInvalidClusterId, clusterId));
+        SuccessOrExit(err = GetChipPathIdValue(attributeIdObj, kInvalidAttributeId, attributeId));
+
+        hasDataVersion = static_cast<bool>(env->CallBooleanMethod(attributeItem, hasDataVersionMethod));
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        if (hasDataVersion)
+        {
+            DataVersion dataVersionVal = static_cast<DataVersion>(env->CallIntMethod(attributeItem, getDataVersionMethod));
+            VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+            dataVersion.SetValue(dataVersionVal);
+        }
+
+        tlvBytesObj = static_cast<jbyteArray>(env->CallObjectMethod(attributeItem, getTlvByteArrayMethod));
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        VerifyOrExit(tlvBytesObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+        tlvBytesObjBytes = env->GetByteArrayElements(tlvBytesObj, nullptr);
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+        length = env->GetArrayLength(tlvBytesObj);
+        VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+
+        reader.Init(reinterpret_cast<const uint8_t *>(tlvBytesObjBytes), static_cast<size_t>(length));
+        reader.Next();
+        SuccessOrExit(
+            err = writeClient->PutPreencodedAttribute(
+                chip::app::ConcreteDataAttributePath(static_cast<EndpointId>(endpointId), static_cast<ClusterId>(clusterId),
+                                                     static_cast<AttributeId>(attributeId), dataVersion),
+                reader));
+    }
+
+    err = writeClient->SendWriteRequest(device->GetSecureSession().Value(),
+                                        imTimeoutMs != 0 ? System::Clock::Milliseconds32(imTimeoutMs) : System::Clock::kZero);
+    SuccessOrExit(err);
+    callback->mWriteClient = writeClient;
+
+exit:
+
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(Controller, "JNI IM Write Error: %s", err.AsString());
+        if (err == CHIP_JNI_ERROR_EXCEPTION_THROWN)
+        {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        callback->OnError(writeClient, err);
+        if (writeClient != nullptr)
+        {
+            Platform::Delete(writeClient);
+        }
+        if (callback != nullptr)
+        {
+            Platform::Delete(callback);
+        }
+    }
+}
+
+JNI_METHOD(void, invoke)
+(JNIEnv * env, jobject self, jlong handle, jlong callbackHandle, jlong devicePtr, jobject invokeElement, jint timedRequestTimeoutMs,
+ jint imTimeoutMs)
+{
+    chip::DeviceLayer::StackLock lock;
+    CHIP_ERROR err = CHIP_NO_ERROR;
+    auto callback  = reinterpret_cast<InvokeCallback *>(callbackHandle);
+    app::CommandSender * commandSender;
+    uint32_t endpointId             = 0;
+    uint32_t clusterId              = 0;
+    uint32_t commandId              = 0;
+    jmethodID getEndpointIdMethod   = nullptr;
+    jmethodID getClusterIdMethod    = nullptr;
+    jmethodID getCommandIdMethod    = nullptr;
+    jmethodID getTlvByteArrayMethod = nullptr;
+    jobject endpointIdObj           = nullptr;
+    jobject clusterIdObj            = nullptr;
+    jobject commandIdObj            = nullptr;
+    jbyteArray tlvBytesObj          = nullptr;
+    jbyte * tlvBytesObjBytes        = nullptr;
+    jsize length                    = 0;
+    TLV::TLVReader reader;
+    TLV::TLVWriter * writer = nullptr;
+
+    ChipLogDetail(Controller, "IM invoke() called");
+
+    DeviceProxy * device = reinterpret_cast<DeviceProxy *>(devicePtr);
+    VerifyOrExit(device != nullptr, err = CHIP_ERROR_INCORRECT_STATE);
+    VerifyOrExit(device->GetSecureSession().HasValue(), err = CHIP_ERROR_MISSING_SECURE_SESSION);
+
+    commandSender = Platform::New<app::CommandSender>(callback, device->GetExchangeManager(), timedRequestTimeoutMs != 0);
+
+    SuccessOrExit(err = JniReferences::GetInstance().FindMethod(
+                      env, invokeElement, "getEndpointId", "()Lchip/devicecontroller/model/ChipPathId;", &getEndpointIdMethod));
+    SuccessOrExit(err = JniReferences::GetInstance().FindMethod(env, invokeElement, "getClusterId",
+                                                                "()Lchip/devicecontroller/model/ChipPathId;", &getClusterIdMethod));
+    SuccessOrExit(err = JniReferences::GetInstance().FindMethod(env, invokeElement, "getCommandId",
+                                                                "()Lchip/devicecontroller/model/ChipPathId;", &getCommandIdMethod));
+    SuccessOrExit(
+        err = JniReferences::GetInstance().FindMethod(env, invokeElement, "getTlvByteArray", "()[B", &getTlvByteArrayMethod));
+
+    endpointIdObj = env->CallObjectMethod(invokeElement, getEndpointIdMethod);
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    VerifyOrExit(endpointIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+    clusterIdObj = env->CallObjectMethod(invokeElement, getClusterIdMethod);
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    VerifyOrExit(clusterIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+    commandIdObj = env->CallObjectMethod(invokeElement, getCommandIdMethod);
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    VerifyOrExit(commandIdObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+    SuccessOrExit(err = GetChipPathIdValue(endpointIdObj, kInvalidEndpointId, endpointId));
+    SuccessOrExit(err = GetChipPathIdValue(clusterIdObj, kInvalidClusterId, clusterId));
+    SuccessOrExit(err = GetChipPathIdValue(commandIdObj, kInvalidCommandId, commandId));
+
+    tlvBytesObj = static_cast<jbyteArray>(env->CallObjectMethod(invokeElement, getTlvByteArrayMethod));
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    VerifyOrExit(tlvBytesObj != nullptr, err = CHIP_ERROR_INVALID_ARGUMENT);
+
+    tlvBytesObjBytes = env->GetByteArrayElements(tlvBytesObj, nullptr);
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    length = env->GetArrayLength(tlvBytesObj);
+    VerifyOrExit(!env->ExceptionCheck(), err = CHIP_JNI_ERROR_EXCEPTION_THROWN);
+    SuccessOrExit(err = commandSender->PrepareCommand(app::CommandPathParams(static_cast<EndpointId>(endpointId), /* group id */ 0,
+                                                                             static_cast<ClusterId>(clusterId),
+                                                                             static_cast<CommandId>(commandId),
+                                                                             app::CommandPathFlags::kEndpointIdValid),
+                                                      false));
+
+    writer = commandSender->GetCommandDataIBTLVWriter();
+    VerifyOrExit(writer != nullptr, err = CHIP_ERROR_INCORRECT_STATE);
+    reader.Init(reinterpret_cast<const uint8_t *>(tlvBytesObjBytes), static_cast<size_t>(length));
+    reader.Next();
+    SuccessOrExit(err = writer->CopyContainer(TLV::ContextTag(app::CommandDataIB::Tag::kFields), reader));
+
+    SuccessOrExit(err = commandSender->FinishCommand(timedRequestTimeoutMs != 0 ? Optional<uint16_t>(timedRequestTimeoutMs)
+                                                                                : Optional<uint16_t>::Missing()));
+
+    SuccessOrExit(err =
+                      commandSender->SendCommandRequest(device->GetSecureSession().Value(),
+                                                        imTimeoutMs != 0 ? MakeOptional(System::Clock::Milliseconds32(imTimeoutMs))
+                                                                         : Optional<System::Clock::Timeout>::Missing()));
+
+    callback->mCommandSender = commandSender;
+
+exit:
+
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(Controller, "JNI IM Invoke Error: %s", err.AsString());
+        if (err == CHIP_JNI_ERROR_EXCEPTION_THROWN)
+        {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        callback->OnError(nullptr, err);
+        if (commandSender != nullptr)
+        {
+            Platform::Delete(commandSender);
+        }
+        if (callback != nullptr)
+        {
+            Platform::Delete(callback);
+        }
+    }
 }
 
 /**
