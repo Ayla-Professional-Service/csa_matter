@@ -533,7 +533,7 @@ endforeach()
 target_link_libraries(${COMPONENT_LIB} INTERFACE -Wl,--start-group
                                                 ${chip_libraries}
                                                 $<TARGET_FILE:mbedcrypto> $<TARGET_FILE:mbedx509>
-                                                $<TARGET_FILE:${mbedtls_lib}>
+                                                $<TARGET_FILE:mbedtls>
                                                 -Wl,--end-group)
 
 # Make the component dependent on our CHIP build
